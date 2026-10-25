@@ -311,24 +311,29 @@ static void dw8250_set_termios(struct uart_port *p, struct ktermios *termios,
 	unsigned int baud = tty_termios_baud_rate(termios);
 	struct dw8250_data *d = p->private_data;
 	long rate;
-	int ret;
 
-	clk_disable_unprepare(d->clk);
-	rate = clk_round_rate(d->clk, baud * 16);
-	if (rate < 0)
-		ret = rate;
-	else if (rate == 0)
-		ret = -ENOENT;
-	else
-		ret = clk_set_rate(d->clk, rate);
-	clk_prepare_enable(d->clk);
+	/*
+	 * FH8626 divides ~100 MHz by 1..32: rounding 115200*16 yields
+	 * ~3.125 MHz,
+	 * or ~195200 baud with an integer divisor. Change uartclk only if the
+	 * resulting baud rate is within 2% of the request.
+	 */
+	if (baud && d->clk) {
+		unsigned long step = (unsigned long)baud * 16;
+		unsigned int quot, actual, diff;
 
-	if (ret)
-		goto out;
+		rate = clk_round_rate(d->clk, step);
+		quot = rate > 0 ? (unsigned int)rate / step : 0;
+		actual = quot ? (unsigned int)rate / (16U * quot) : 0;
+		diff = actual > baud ? actual - baud : baud - actual;
+		if (quot && diff <= baud / 50) {
+			clk_disable_unprepare(d->clk);
+			if (!clk_set_rate(d->clk, rate))
+				p->uartclk = rate;
+			clk_prepare_enable(d->clk);
+		}
+	}
 
-	p->uartclk = rate;
-
-out:
 	p->status &= ~UPSTAT_AUTOCTS;
 	if (termios->c_cflag & CRTSCTS)
 		p->status |= UPSTAT_AUTOCTS;
