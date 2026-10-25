@@ -53,6 +53,7 @@
 #include "core.h"
 #include "hcd.h"
 #include "debug.h"
+#include "fh8626.h"
 
 static const char dwc2_driver_name[] = "dwc2";
 
@@ -137,7 +138,9 @@ static int __dwc2_lowlevel_hw_enable(struct dwc2_hsotg *hsotg)
 			return ret;
 	}
 
-	if (hsotg->uphy) {
+	if (hsotg->fh8626)
+		ret = dwc2_fh8626_enable(hsotg);
+	else if (hsotg->uphy) {
 		ret = usb_phy_init(hsotg->uphy);
 	} else if (hsotg->plat && hsotg->plat->phy_init) {
 		ret = hsotg->plat->phy_init(pdev, hsotg->plat->phy_type);
@@ -171,7 +174,9 @@ static int __dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
 	struct platform_device *pdev = to_platform_device(hsotg->dev);
 	int ret = 0;
 
-	if (hsotg->uphy) {
+	if (hsotg->fh8626)
+		dwc2_fh8626_disable(hsotg);
+	else if (hsotg->uphy) {
 		usb_phy_shutdown(hsotg->uphy);
 	} else if (hsotg->plat && hsotg->plat->phy_exit) {
 		ret = hsotg->plat->phy_exit(pdev, hsotg->plat->phy_type);
@@ -211,6 +216,14 @@ int dwc2_lowlevel_hw_disable(struct dwc2_hsotg *hsotg)
 static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
 {
 	int i, ret;
+
+	ret = dwc2_fh8626_init(hsotg);
+	if (ret)
+		return ret;
+	if (hsotg->fh8626) {
+		hsotg->phyif = GUSBCFG_PHYIF16;
+		goto get_clock;
+	}
 
 	hsotg->reset = devm_reset_control_get_optional(hsotg->dev, "dwc2");
 	if (IS_ERR(hsotg->reset)) {
@@ -283,9 +296,12 @@ static int dwc2_lowlevel_hw_init(struct dwc2_hsotg *hsotg)
 			hsotg->phyif = GUSBCFG_PHYIF8;
 	}
 
+get_clock:
 	/* Clock */
 	hsotg->clk = devm_clk_get(hsotg->dev, "otg");
 	if (IS_ERR(hsotg->clk)) {
+		if (hsotg->fh8626 || PTR_ERR(hsotg->clk) == -EPROBE_DEFER)
+			return PTR_ERR(hsotg->clk);
 		hsotg->clk = NULL;
 		dev_dbg(hsotg->dev, "cannot get otg clock\n");
 	}
@@ -520,6 +536,9 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
 	int ret = 0;
+
+	if (dwc2->fh8626)
+		return -EOPNOTSUPP;
 
 	if (dwc2_is_device_mode(dwc2))
 		dwc2_hsotg_suspend(dwc2);

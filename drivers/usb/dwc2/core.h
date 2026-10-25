@@ -1045,6 +1045,7 @@ struct dwc2_hsotg {
 	void *priv;
 	int     irq;
 	struct clk *clk;
+	struct dwc2_fh8626 *fh8626;
 	struct reset_control *reset;
 	struct reset_control *reset_ecc;
 

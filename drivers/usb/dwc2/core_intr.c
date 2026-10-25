@@ -53,6 +53,7 @@
 
 #include "core.h"
 #include "hcd.h"
+#include "fh8626.h"
 
 static const char *dwc2_op_state_str(struct dwc2_hsotg *hsotg)
 {
@@ -482,6 +483,8 @@ static void dwc2_handle_wakeup_detected_intr(struct dwc2_hsotg *hsotg)
  */
 static void dwc2_handle_disconnect_intr(struct dwc2_hsotg *hsotg)
 {
+	if (hsotg->op_state == OTG_STATE_A_HOST)
+		dwc2_fh8626_report_disconnect(hsotg);
 	dwc2_writel(hsotg, GINTSTS_DISCONNINT, GINTSTS);
 
 	dev_dbg(hsotg->dev, "++Disconnect Detected Interrupt++ (%s) %s\n",
