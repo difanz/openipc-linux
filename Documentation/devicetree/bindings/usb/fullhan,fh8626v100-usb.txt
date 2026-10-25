@@ -1,0 +1,18 @@
+Fullhan FH8626V100 USB host
+==========================
+
+Synopsys DWC2 with integrated UTMI PHY and Fullhan PMU sequence.
+Required properties:
+- compatible: "fullhan,fh8626v100-usb" (no generic fallback)
+- reg: controller window, 0xe0700000 / 0x4000 on V100
+- interrupts: hardware source 27
+- clocks: USB functional clock and USB HCLK gate
+- clock-names: "otg", "hclk"
+- dr_mode: "host"
+- vbus-supply: explicit regulator controlling the board's downstream USB power
+
+The Fullhan PMU/clock provider supplies serialized register access. No
+second PMU mapping, external PHY or reset phandle is needed for this IP.
+Only integrated UTMI 16-bit host is supported. The board describes its power
+switch as a regulator; the driver does not assume a GPIO number or voltage.
+
