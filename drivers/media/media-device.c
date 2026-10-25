@@ -787,6 +787,7 @@ EXPORT_SYMBOL_GPL(media_device_unregister_entity_notify);
 
 void media_device_unregister(struct media_device *mdev)
 {
+	struct media_devnode *devnode;
 	struct media_entity *entity;
 	struct media_entity *next;
 	struct media_interface *intf, *tmp_intf;
@@ -795,11 +796,20 @@ void media_device_unregister(struct media_device *mdev)
 	if (mdev == NULL)
 		return;
 
+	devnode = mdev->devnode;
+	if (!devnode)
+		return;
+	/*
+	 * Drain active ioctls before removing graph objects. Match the ioctl
+	 * path's ioctl_lock -> graph_mutex locking order.
+	 */
+	mutex_lock(&devnode->ioctl_lock);
 	mutex_lock(&mdev->graph_mutex);
 
 	/* Check if mdev was ever registered at all */
 	if (!media_devnode_is_registered(mdev->devnode)) {
 		mutex_unlock(&mdev->graph_mutex);
+		mutex_unlock(&devnode->ioctl_lock);
 		return;
 	}
 
@@ -827,6 +837,7 @@ void media_device_unregister(struct media_device *mdev)
 	}
 
 	mutex_unlock(&mdev->graph_mutex);
+	mutex_unlock(&devnode->ioctl_lock);
 
 	dev_dbg(mdev->dev, "Media device unregistered\n");
 

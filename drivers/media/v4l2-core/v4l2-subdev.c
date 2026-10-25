@@ -22,6 +22,7 @@
 #include <linux/types.h>
 #include <linux/videodev2.h>
 #include <linux/export.h>
+#include <linux/module.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -54,19 +55,24 @@ static int subdev_open(struct file *file)
 	struct video_device *vdev = video_devdata(file);
 	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
 	struct v4l2_subdev_fh *subdev_fh;
-#if defined(CONFIG_MEDIA_CONTROLLER)
-	struct media_entity *entity = NULL;
-#endif
 	int ret;
 
+	if (mutex_lock_interruptible(&sd->devnode_mutex))
+		return -ERESTARTSYS;
+	if (!video_is_registered(vdev) || !sd->v4l2_dev) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 	subdev_fh = kzalloc(sizeof(*subdev_fh), GFP_KERNEL);
-	if (subdev_fh == NULL)
-		return -ENOMEM;
+	if (subdev_fh == NULL) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
 
 	ret = subdev_fh_init(subdev_fh, sd);
 	if (ret) {
 		kfree(subdev_fh);
-		return ret;
+		goto out_unlock;
 	}
 
 	v4l2_fh_init(&subdev_fh->vfh, vdev);
@@ -74,11 +80,20 @@ static int subdev_open(struct file *file)
 	file->private_data = &subdev_fh->vfh;
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	if (sd->v4l2_dev->mdev) {
-		entity = media_entity_get(&sd->entity);
-		if (!entity) {
+		struct device *dev = sd->v4l2_dev->mdev->dev;
+		struct module *owner = dev && dev->driver ?
+			dev->driver->owner : NULL;
+
+		if (!try_module_get(owner)) {
 			ret = -EBUSY;
 			goto err;
 		}
+		/*
+		 * Entity unregister clears graph_obj.mdev. Save only the module
+		 * reference needed at close, without following the
+		 * removed graph.
+		 */
+		subdev_fh->owner = owner;
 	}
 #endif
 
@@ -88,17 +103,18 @@ static int subdev_open(struct file *file)
 			goto err;
 	}
 
+	mutex_unlock(&sd->devnode_mutex);
 	return 0;
 
 err:
-#if defined(CONFIG_MEDIA_CONTROLLER)
-	media_entity_put(entity);
-#endif
+	module_put(subdev_fh->owner);
 	v4l2_fh_del(&subdev_fh->vfh);
 	v4l2_fh_exit(&subdev_fh->vfh);
 	subdev_fh_free(subdev_fh);
 	kfree(subdev_fh);
-
+	file->private_data = NULL;
+out_unlock:
+	mutex_unlock(&sd->devnode_mutex);
 	return ret;
 }
 
@@ -111,10 +127,7 @@ static int subdev_close(struct file *file)
 
 	if (sd->internal_ops && sd->internal_ops->close)
 		sd->internal_ops->close(sd, subdev_fh);
-#if defined(CONFIG_MEDIA_CONTROLLER)
-	if (sd->v4l2_dev->mdev)
-		media_entity_put(&sd->entity);
-#endif
+	module_put(subdev_fh->owner);
 	v4l2_fh_del(vfh);
 	v4l2_fh_exit(vfh);
 	subdev_fh_free(subdev_fh);
@@ -551,8 +564,14 @@ static long subdev_compat_ioctl32(struct file *file, unsigned int cmd,
 {
 	struct video_device *vdev = video_devdata(file);
 	struct v4l2_subdev *sd = vdev_to_v4l2_subdev(vdev);
+	long ret = -ENODEV;
 
-	return v4l2_subdev_call(sd, core, compat_ioctl32, cmd, arg);
+	if (mutex_lock_interruptible(&sd->devnode_mutex))
+		return -ERESTARTSYS;
+	if (video_is_registered(vdev))
+		ret = v4l2_subdev_call(sd, core, compat_ioctl32, cmd, arg);
+	mutex_unlock(&sd->devnode_mutex);
+	return ret;
 }
 #endif
 
@@ -566,6 +585,8 @@ static __poll_t subdev_poll(struct file *file, poll_table *wait)
 		return EPOLLERR;
 
 	poll_wait(file, &fh->wait, wait);
+	if (!video_is_registered(vdev))
+		return EPOLLERR | EPOLLHUP;
 
 	if (v4l2_event_pending(fh))
 		return EPOLLPRI;
@@ -690,6 +711,9 @@ EXPORT_SYMBOL_GPL(v4l2_subdev_free_pad_config);
 void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
 {
 	INIT_LIST_HEAD(&sd->list);
+	mutex_init(&sd->devnode_mutex);
+	sd->devnode = NULL;
+	sd->devnode_ref = false;
 	BUG_ON(!ops);
 	sd->ops = ops;
 	sd->v4l2_dev = NULL;

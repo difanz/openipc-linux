@@ -18,6 +18,7 @@
 #define _V4L2_SUBDEV_H
 
 #include <linux/types.h>
+#include <linux/mutex.h>
 #include <linux/v4l2-subdev.h>
 #include <media/media-entity.h>
 #include <media/v4l2-async.h>
@@ -761,6 +762,11 @@ struct v4l2_subdev_ops {
  *
  * @close: called when the subdev device node is closed.
  *
+ * @release: called after unregister and the last devnode reference is gone.
+ *	May free the subdev and its controls. The supplier module is retained
+ *	until this callback returns. Drivers using devnodes keep the subdev
+ *	storage alive through this callback.
+ *
  * .. note::
  *	Never call this from drivers, only the v4l2 framework can call
  *	these ops.
@@ -770,6 +776,7 @@ struct v4l2_subdev_internal_ops {
 	void (*unregistered)(struct v4l2_subdev *sd);
 	int (*open)(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh);
 	int (*close)(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh);
+	void (*release)(struct v4l2_subdev *sd);
 };
 
 #define V4L2_SUBDEV_NAME_SIZE 32
@@ -826,6 +833,8 @@ struct v4l2_subdev_platform_data {
  * @host_priv: pointer to private data used by the device where the subdev
  *	is attached.
  * @devnode: subdev device node
+ * @devnode_mutex: serializes devnode publication, open/ioctl and unregister
+ * @devnode_ref: registration owns an extra devnode reference
  * @dev: pointer to the physical device, if any
  * @fwnode: The fwnode_handle of the subdev, usually the same as
  *	    either dev->of_node->fwnode or dev->fwnode (whichever is non-NULL).
@@ -860,6 +869,8 @@ struct v4l2_subdev {
 	void *dev_priv;
 	void *host_priv;
 	struct video_device *devnode;
+	struct mutex devnode_mutex;
+	bool devnode_ref;
 	struct device *dev;
 	struct fwnode_handle *fwnode;
 	struct list_head async_list;
@@ -898,10 +909,12 @@ struct v4l2_subdev {
  * struct v4l2_subdev_fh - Used for storing subdev information per file handle
  *
  * @vfh: pointer to &struct v4l2_fh
+ * @owner: media bridge module retained from open until close
  * @pad: pointer to &struct v4l2_subdev_pad_config
  */
 struct v4l2_subdev_fh {
 	struct v4l2_fh vfh;
+	struct module *owner;
 #if defined(CONFIG_VIDEO_V4L2_SUBDEV_API)
 	struct v4l2_subdev_pad_config *pad;
 #endif

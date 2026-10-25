@@ -117,14 +117,20 @@ __media_ioctl(struct file *filp, unsigned int cmd, unsigned long arg,
 				 unsigned long arg))
 {
 	struct media_devnode *devnode = media_devnode_data(filp);
+	long ret;
 
 	if (!ioctl_func)
 		return -ENOTTY;
 
+	if (mutex_lock_interruptible(&devnode->ioctl_lock))
+		return -ERESTARTSYS;
+	/* The node outlives open fds, but its media_device need not. */
 	if (!media_devnode_is_registered(devnode))
-		return -EIO;
-
-	return ioctl_func(filp, cmd, arg);
+		ret = -EIO;
+	else
+		ret = ioctl_func(filp, cmd, arg);
+	mutex_unlock(&devnode->ioctl_lock);
+	return ret;
 }
 
 static long media_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -238,6 +244,7 @@ int __must_check media_devnode_register(struct media_device *mdev,
 
 	devnode->minor = minor;
 	devnode->media_dev = mdev;
+	mutex_init(&devnode->ioctl_lock);
 
 	/* Part 1: Initialize dev now to use dev.kobj for cdev.kobj.parent */
 	devnode->dev.bus = &media_bus_type;
@@ -264,10 +271,13 @@ int __must_check media_devnode_register(struct media_device *mdev,
 	return 0;
 
 cdev_add_error:
+	/* cdev_device_add() can publish the cdev before a later failure. */
+	mutex_lock(&devnode->ioctl_lock);
 	mutex_lock(&media_devnode_lock);
 	clear_bit(devnode->minor, media_devnode_nums);
 	devnode->media_dev = NULL;
 	mutex_unlock(&media_devnode_lock);
+	mutex_unlock(&devnode->ioctl_lock);
 
 	put_device(&devnode->dev);
 	return ret;
@@ -286,11 +296,15 @@ void media_devnode_unregister_prepare(struct media_devnode *devnode)
 
 void media_devnode_unregister(struct media_devnode *devnode)
 {
+	/* Also drain ioctls on the registration-error cleanup path. */
+	mutex_lock(&devnode->ioctl_lock);
+	media_devnode_unregister_prepare(devnode);
+	devnode->media_dev = NULL;
+	mutex_unlock(&devnode->ioctl_lock);
 	mutex_lock(&media_devnode_lock);
 	/* Delete the cdev on this minor as well */
 	cdev_device_del(&devnode->cdev, &devnode->dev);
 	mutex_unlock(&media_devnode_lock);
-	devnode->media_dev = NULL;
 	put_device(&devnode->dev);
 }
 

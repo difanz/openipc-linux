@@ -32,6 +32,7 @@
 #include <media/v4l2-common.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
+#include <media/v4l2-fh.h>
 
 #define VIDEO_NUM_DEVICES	256
 #define VIDEO_NAME              "video4linux"
@@ -1029,6 +1030,9 @@ EXPORT_SYMBOL(__video_register_device);
  */
 void video_unregister_device(struct video_device *vdev)
 {
+	struct v4l2_fh *fh;
+	unsigned long flags;
+
 	/* Check if vdev was ever registered at all */
 	if (!vdev || !video_is_registered(vdev))
 		return;
@@ -1039,6 +1043,11 @@ void video_unregister_device(struct video_device *vdev)
 	 */
 	clear_bit(V4L2_FL_REGISTERED, &vdev->flags);
 	mutex_unlock(&videodev_lock);
+	/* Wake any waiters in DQEVENT or poll on device unregister. */
+	spin_lock_irqsave(&vdev->fh_lock, flags);
+	list_for_each_entry(fh, &vdev->fh_list, list)
+		wake_up_all(&fh->wait);
+	spin_unlock_irqrestore(&vdev->fh_lock, flags);
 	device_unregister(&vdev->dev);
 }
 EXPORT_SYMBOL(video_unregister_device);

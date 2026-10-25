@@ -65,6 +65,8 @@ int v4l2_event_dequeue(struct v4l2_fh *fh, struct v4l2_event *event,
 {
 	int ret;
 
+	if (!video_is_registered(fh->vdev))
+		return -ENODEV;
 	if (nonblocking)
 		return __v4l2_event_dequeue(fh, event);
 
@@ -74,9 +76,14 @@ int v4l2_event_dequeue(struct v4l2_fh *fh, struct v4l2_event *event,
 
 	do {
 		ret = wait_event_interruptible(fh->wait,
-					       fh->navailable != 0);
+					       fh->navailable != 0 ||
+					       !video_is_registered(fh->vdev));
 		if (ret < 0)
 			break;
+		if (!video_is_registered(fh->vdev)) {
+			ret = -ENODEV;
+			break;
+		}
 
 		ret = __v4l2_event_dequeue(fh, event);
 	} while (ret == -ENOENT);

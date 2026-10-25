@@ -113,10 +113,16 @@ void v4l2_device_unregister(struct v4l2_device *v4l2_dev)
 
 	/* Unregister subdevs */
 	list_for_each_entry_safe(sd, next, &v4l2_dev->subdevs, list) {
+#if IS_ENABLED(CONFIG_I2C) || defined(CONFIG_SPI)
+		/* The release callback may free sd during unregister. */
+		u32 flags = sd->flags;
+		void *subdev_data = v4l2_get_subdevdata(sd);
+#endif
+
 		v4l2_device_unregister_subdev(sd);
 #if IS_ENABLED(CONFIG_I2C)
-		if (sd->flags & V4L2_SUBDEV_FL_IS_I2C) {
-			struct i2c_client *client = v4l2_get_subdevdata(sd);
+		if (flags & V4L2_SUBDEV_FL_IS_I2C) {
+			struct i2c_client *client = subdev_data;
 
 			/*
 			 * We need to unregister the i2c client
@@ -137,8 +143,8 @@ void v4l2_device_unregister(struct v4l2_device *v4l2_dev)
 		}
 #endif
 #if defined(CONFIG_SPI)
-		if (sd->flags & V4L2_SUBDEV_FL_IS_SPI) {
-			struct spi_device *spi = v4l2_get_subdevdata(sd);
+		if (flags & V4L2_SUBDEV_FL_IS_SPI) {
+			struct spi_device *spi = subdev_data;
 
 			if (spi && !spi->dev.of_node && !spi->dev.fwnode)
 				spi_unregister_device(spi);
@@ -160,8 +166,13 @@ int v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
 	int err;
 
 	/* Check for valid input */
-	if (!v4l2_dev || !sd || sd->v4l2_dev || !sd->name[0])
+	if (!v4l2_dev || !sd || !sd->name[0])
 		return -EINVAL;
+	mutex_lock(&sd->devnode_mutex);
+	if (sd->v4l2_dev || sd->devnode) {
+		err = -EBUSY;
+		goto error_unlock;
+	}
 
 	/*
 	 * The reason to acquire the module here is to avoid unloading
@@ -173,8 +184,10 @@ int v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
 	sd->owner_v4l2_dev = v4l2_dev->dev && v4l2_dev->dev->driver &&
 		sd->owner == v4l2_dev->dev->driver->owner;
 
-	if (!sd->owner_v4l2_dev && !try_module_get(sd->owner))
-		return -ENODEV;
+	if (!sd->owner_v4l2_dev && !try_module_get(sd->owner)) {
+		err = -ENODEV;
+		goto error_unlock;
+	}
 
 	sd->v4l2_dev = v4l2_dev;
 	/* This just returns 0 if either of the two args is NULL */
@@ -200,6 +213,7 @@ int v4l2_device_register_subdev(struct v4l2_device *v4l2_dev,
 	spin_lock(&v4l2_dev->lock);
 	list_add_tail(&sd->list, &v4l2_dev->subdevs);
 	spin_unlock(&v4l2_dev->lock);
+	mutex_unlock(&sd->devnode_mutex);
 
 	return 0;
 
@@ -211,21 +225,45 @@ error_module:
 	if (!sd->owner_v4l2_dev)
 		module_put(sd->owner);
 	sd->v4l2_dev = NULL;
+error_unlock:
+	mutex_unlock(&sd->devnode_mutex);
 	return err;
 }
 EXPORT_SYMBOL_GPL(v4l2_device_register_subdev);
 
+static void v4l2_subdev_release(struct v4l2_subdev *sd, struct module *owner)
+{
+	if (sd->internal_ops && sd->internal_ops->release)
+		sd->internal_ops->release(sd);
+	/*
+	 * The callback may free sd, but its module must outlive the
+	 * callback.
+	 */
+	module_put(owner);
+}
+
 static void v4l2_device_release_subdev_node(struct video_device *vdev)
 {
 	struct v4l2_subdev *sd = video_get_drvdata(vdev);
+	struct module *owner;
+	bool release;
+
+	mutex_lock(&sd->devnode_mutex);
 	sd->devnode = NULL;
+	sd->devnode_ref = false;
+	release = !sd->v4l2_dev;
+	owner = sd->owner_v4l2_dev ? NULL : sd->owner;
+	mutex_unlock(&sd->devnode_mutex);
 	kfree(vdev);
+	if (release)
+		v4l2_subdev_release(sd, owner);
 }
 
 int v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev)
 {
 	struct video_device *vdev;
 	struct v4l2_subdev *sd;
+	struct module *owner;
 	int err;
 
 	/* Register a device node for every subdev marked with the
@@ -235,12 +273,21 @@ int v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev)
 		if (!(sd->flags & V4L2_SUBDEV_FL_HAS_DEVNODE))
 			continue;
 
-		if (sd->devnode)
-			continue;
+		mutex_lock(&sd->devnode_mutex);
+		if (sd->devnode) {
+			if (video_is_registered(sd->devnode)) {
+				mutex_unlock(&sd->devnode_mutex);
+				continue;
+			}
+			mutex_unlock(&sd->devnode_mutex);
+			err = -EBUSY;
+			goto clean_up;
+		}
 
 		vdev = kzalloc(sizeof(*vdev), GFP_KERNEL);
 		if (!vdev) {
 			err = -ENOMEM;
+			mutex_unlock(&sd->devnode_mutex);
 			goto clean_up;
 		}
 
@@ -250,13 +297,28 @@ int v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev)
 		vdev->fops = &v4l2_subdev_fops;
 		vdev->release = v4l2_device_release_subdev_node;
 		vdev->ctrl_handler = sd->ctrl_handler;
+		vdev->lock = &sd->devnode_mutex;
+		/*
+		 * Registration retains the supplier module. Pin the bridge for
+		 * open files, including its final v4l2_device release callback.
+		 */
+		owner = sd->owner;
+		if (v4l2_dev->dev && v4l2_dev->dev->driver)
+			owner = v4l2_dev->dev->driver->owner;
 		err = __video_register_device(vdev, VFL_TYPE_SUBDEV, -1, 1,
-					      sd->owner);
+					      owner);
 		if (err < 0) {
 			kfree(vdev);
+			mutex_unlock(&sd->devnode_mutex);
 			goto clean_up;
 		}
+		/*
+		 * Keep one creation reference through unregister, so final node
+		 * release cannot run under devnode_mutex.
+		 */
+		get_device(&vdev->dev);
 		sd->devnode = vdev;
+		sd->devnode_ref = true;
 #if defined(CONFIG_MEDIA_CONTROLLER)
 		sd->entity.info.dev.major = VIDEO_MAJOR;
 		sd->entity.info.dev.minor = vdev->minor;
@@ -271,18 +333,26 @@ int v4l2_device_register_subdev_nodes(struct v4l2_device *v4l2_dev)
 						      MEDIA_LNK_FL_IMMUTABLE);
 			if (!link) {
 				err = -ENOMEM;
+				mutex_unlock(&sd->devnode_mutex);
 				goto clean_up;
 			}
 		}
 #endif
+		mutex_unlock(&sd->devnode_mutex);
 	}
 	return 0;
 
 clean_up:
 	list_for_each_entry(sd, &v4l2_dev->subdevs, list) {
-		if (!sd->devnode)
-			break;
-		video_unregister_device(sd->devnode);
+		mutex_lock(&sd->devnode_mutex);
+		vdev = sd->devnode_ref ? sd->devnode : NULL;
+		if (vdev) {
+			sd->devnode_ref = false;
+			video_unregister_device(vdev);
+		}
+		mutex_unlock(&sd->devnode_mutex);
+		if (vdev)
+			put_device(&vdev->dev);
 	}
 
 	return err;
@@ -292,12 +362,24 @@ EXPORT_SYMBOL_GPL(v4l2_device_register_subdev_nodes);
 void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
 {
 	struct v4l2_device *v4l2_dev;
+	struct video_device *vdev;
+	struct module *owner;
+	bool node_owned;
 
 	/* return if it isn't registered */
 	if (sd == NULL || sd->v4l2_dev == NULL)
 		return;
 
+	mutex_lock(&sd->devnode_mutex);
 	v4l2_dev = sd->v4l2_dev;
+	if (!v4l2_dev) {
+		mutex_unlock(&sd->devnode_mutex);
+		return;
+	}
+	vdev = sd->devnode;
+	node_owned = sd->devnode_ref;
+	sd->devnode_ref = false;
+	owner = sd->owner_v4l2_dev ? NULL : sd->owner;
 
 	spin_lock(&v4l2_dev->lock);
 	list_del(&sd->list);
@@ -316,8 +398,12 @@ void v4l2_device_unregister_subdev(struct v4l2_subdev *sd)
 		media_device_unregister_entity(&sd->entity);
 	}
 #endif
-	video_unregister_device(sd->devnode);
-	if (!sd->owner_v4l2_dev)
-		module_put(sd->owner);
+	if (node_owned)
+		video_unregister_device(vdev);
+	mutex_unlock(&sd->devnode_mutex);
+	if (node_owned)
+		put_device(&vdev->dev);
+	else if (!vdev)
+		v4l2_subdev_release(sd, owner);
 }
 EXPORT_SYMBOL_GPL(v4l2_device_unregister_subdev);

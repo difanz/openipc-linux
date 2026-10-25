@@ -24,6 +24,8 @@
 #ifndef _MEDIA_DEVNODE_H
 #define _MEDIA_DEVNODE_H
 
+#include <linux/mutex.h>
+
 #include <linux/poll.h>
 #include <linux/fs.h>
 #include <linux/device.h>
@@ -72,6 +74,8 @@ struct media_file_operations {
  * @parent:	parent device
  * @minor:	device node minor number
  * @flags:	flags, combination of the ``MEDIA_FLAG_*`` constants
+ * @ioctl_lock: serializes ioctls with media-device unregister; taken before
+ *		the media graph mutex
  * @release:	release callback called at the end of ``media_devnode_release()``
  *		routine at media-device.c.
  *
@@ -94,6 +98,7 @@ struct media_devnode {
 	/* device info */
 	int minor;
 	unsigned long flags;		/* Use bitops to access flags */
+	struct mutex ioctl_lock;
 
 	/* callbacks */
 	void (*release)(struct media_devnode *devnode);
