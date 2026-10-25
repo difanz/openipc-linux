@@ -276,6 +276,12 @@ struct dw_dma_chan {
 	/* hardware configuration */
 	unsigned int		block_size;
 	bool			nollp;
+	bool			cyclic_error;
+	/*
+	 * Hardware may still be reading a cyclic ring. Do not free its
+	 * descriptors or let a new client reuse the channel.
+	 */
+	bool			stop_failed;
 
 	/* custom slave configuration */
 	struct dw_dma_slave	dws;
@@ -306,6 +312,7 @@ struct dw_dma {
 	void __iomem		*regs;
 	struct dma_pool		*desc_pool;
 	struct tasklet_struct	tasklet;
+	int			irq;
 
 	/* channels */
 	struct dw_dma_chan	*chan;
@@ -314,6 +321,7 @@ struct dw_dma {
 
 	/* platform data */
 	struct dw_dma_platform_data	*pdata;
+	bool			compact_params;
 };
 
 static inline struct dw_dma_regs __iomem *__dw_regs(struct dw_dma *dw)
@@ -373,6 +381,7 @@ struct dw_desc {
 	size_t				len;
 	size_t				total_len;
 	u32				residue;
+	bool				cyclic;
 };
 
 #define to_dw_desc(h)	list_entry(h, struct dw_desc, desc_node)

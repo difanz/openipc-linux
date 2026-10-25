@@ -39,6 +39,11 @@ struct dw_dma_chip {
 	struct dw_dma	*dw;
 
 	const struct dw_dma_platform_data	*pdata;
+	/*
+	 * Channel parameters are packed by the channel count. The initial
+	 * controller shutdown uses a bounded wait.
+	 */
+	bool		compact_params;
 };
 
 /* Export to the platform drivers */

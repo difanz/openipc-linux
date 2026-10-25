@@ -217,6 +217,9 @@ static int dw_probe(struct platform_device *pdev)
 	chip->dev = dev;
 	chip->id = pdev->id;
 	chip->pdata = pdata;
+	if (dev->of_node &&
+	    of_device_is_compatible(dev->of_node, "fullhan,fh8626v100-dma"))
+		chip->compact_params = true;
 
 	chip->clk = devm_clk_get(chip->dev, "hclk");
 	if (IS_ERR(chip->clk))
@@ -292,6 +295,7 @@ static void dw_shutdown(struct platform_device *pdev)
 #ifdef CONFIG_OF
 static const struct of_device_id dw_dma_of_id_table[] = {
 	{ .compatible = "snps,dma-spear1340" },
+	{ .compatible = "fullhan,fh8626v100-dma" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, dw_dma_of_id_table);

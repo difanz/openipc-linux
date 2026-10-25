@@ -1507,6 +1507,8 @@ F:	drivers/soc/fullhan/
 F:	drivers/usb/dwc2/fh8626.c
 F:	drivers/usb/dwc2/fh8626.h
 F:	drivers/net/ethernet/stmicro/stmmac/dwmac-fh8626.c
+F:	drivers/dma/dw/core.c
+F:	drivers/dma/dw/platform.c
 F:	include/linux/soc/fullhan/
 F:	include/dt-bindings/clock/fh8626v100-clk.h
 F:	Documentation/devicetree/bindings/arm/fullhan.txt
