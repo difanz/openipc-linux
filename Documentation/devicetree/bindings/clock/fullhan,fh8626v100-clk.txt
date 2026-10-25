@@ -1,0 +1,22 @@
+Fullhan FH8626V100 clock controller
+
+Required properties:
+- compatible: "fullhan,fh8626v100-clk"
+- reg: the PMU window. This node shares that window with the
+  "fullhan,fh8626v100-pmu" system controller.
+- #clock-cells: must be <1>
+- clocks: the oscillator input
+- clock-names: "osc"
+
+Clock index values are defined in
+include/dt-bindings/clock/fh8626v100-clk.h.
+
+Example:
+
+	clock-controller@f0000000 {
+		compatible = "fullhan,fh8626v100-clk";
+		reg = <0xf0000000 0x4000>;
+		#clock-cells = <1>;
+		clocks = <&osc>;
+		clock-names = "osc";
+	};
