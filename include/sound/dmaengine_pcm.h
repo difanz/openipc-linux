@@ -42,6 +42,7 @@ int snd_dmaengine_pcm_close_release_chan(struct snd_pcm_substream *substream);
 struct dma_chan *snd_dmaengine_pcm_request_channel(dma_filter_fn filter_fn,
 	void *filter_data);
 struct dma_chan *snd_dmaengine_pcm_get_chan(struct snd_pcm_substream *substream);
+dma_cookie_t snd_dmaengine_pcm_get_cookie(struct snd_pcm_substream *substream);
 
 /*
  * The DAI supports packed transfers, eg 2 16-bit samples in a 32-bit word.

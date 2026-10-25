@@ -49,6 +49,14 @@ struct dma_chan *snd_dmaengine_pcm_get_chan(struct snd_pcm_substream *substream)
 }
 EXPORT_SYMBOL_GPL(snd_dmaengine_pcm_get_chan);
 
+dma_cookie_t snd_dmaengine_pcm_get_cookie(struct snd_pcm_substream *substream)
+{
+	struct dmaengine_pcm_runtime_data *prtd = substream_to_prtd(substream);
+
+	return prtd ? prtd->cookie : 0;
+}
+EXPORT_SYMBOL_GPL(snd_dmaengine_pcm_get_cookie);
+
 /**
  * snd_hwparams_to_dma_slave_config - Convert hw_params to dma_slave_config
  * @substream: PCM substream
@@ -137,11 +145,17 @@ void snd_dmaengine_pcm_set_config_from_dai_data(
 }
 EXPORT_SYMBOL_GPL(snd_dmaengine_pcm_set_config_from_dai_data);
 
-static void dmaengine_pcm_dma_complete(void *arg)
+static void dmaengine_pcm_dma_complete(void *arg,
+				       const struct dmaengine_result *result)
 {
 	unsigned int new_pos;
 	struct snd_pcm_substream *substream = arg;
 	struct dmaengine_pcm_runtime_data *prtd = substream_to_prtd(substream);
+
+	if (result && result->result != DMA_TRANS_NOERROR) {
+		snd_pcm_stop_xrun(substream);
+		return;
+	}
 
 	new_pos = prtd->pos + snd_pcm_lib_period_bytes(substream);
 	if (new_pos >= snd_pcm_lib_buffer_bytes(substream))
@@ -173,7 +187,8 @@ static int dmaengine_pcm_prepare_and_submit(struct snd_pcm_substream *substream)
 	if (!desc)
 		return -ENOMEM;
 
-	desc->callback = dmaengine_pcm_dma_complete;
+	desc->callback = NULL;
+	desc->callback_result = dmaengine_pcm_dma_complete;
 	desc->callback_param = substream;
 	prtd->cookie = dmaengine_submit(desc);
 

@@ -26,6 +26,9 @@ struct dmaengine_pcm {
 	const struct snd_dmaengine_pcm_config *config;
 	struct snd_soc_component component;
 	unsigned int flags;
+	/* Pages a timed-out cyclic DMA ring may still be accessing. */
+	struct snd_dma_buffer retained[SNDRV_PCM_STREAM_LAST + 1];
+	dma_cookie_t retained_cookie[SNDRV_PCM_STREAM_LAST + 1];
 };
 
 static struct dmaengine_pcm *soc_component_to_pcm(struct snd_soc_component *p)
@@ -75,6 +78,163 @@ int snd_dmaengine_pcm_prepare_slave_config(struct snd_pcm_substream *substream,
 }
 EXPORT_SYMBOL_GPL(snd_dmaengine_pcm_prepare_slave_config);
 
+static bool dmaengine_pcm_cookie_idle(struct dma_chan *chan,
+	dma_cookie_t cookie)
+{
+	struct dma_tx_state state;
+
+	if (!chan || cookie <= 0)
+		return true;
+	return dmaengine_tx_status(chan, cookie, &state) == DMA_COMPLETE;
+}
+
+static void dmaengine_pcm_halt(struct dma_chan *chan)
+{
+	if (!chan)
+		return;
+	/*
+	 * terminate_sync() returns before synchronizing when halt fails.
+	 * The controller can still retire the ring from synchronize().
+	 */
+	dmaengine_terminate_async(chan);
+	dmaengine_synchronize(chan);
+}
+
+static void dmaengine_pcm_free_retained(struct dmaengine_pcm *pcm, int stream)
+{
+	if (!pcm->retained[stream].area)
+		return;
+	snd_dma_free_pages(&pcm->retained[stream]);
+	memset(&pcm->retained[stream], 0, sizeof(pcm->retained[stream]));
+	pcm->retained_cookie[stream] = 0;
+}
+
+/*
+ * Move the runtime mapping out of ALSA without freeing pages the device
+ * may still fetch. A preallocated buffer is detached so PCM teardown and
+ * the next hw_params cannot reuse or release it.
+ */
+static void dmaengine_pcm_detach_runtime_buffer(
+	struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_dma_buffer *buf = runtime->dma_buffer_p;
+
+	if (buf == &substream->dma_buffer) {
+		substream->dma_buffer.area = NULL;
+		substream->dma_buffer.addr = 0;
+		substream->dma_buffer.bytes = 0;
+	} else {
+		kfree(buf);
+	}
+	snd_pcm_set_runtime_buffer(substream, NULL);
+}
+
+static int dmaengine_pcm_retain_buffer(struct dmaengine_pcm *pcm,
+				       struct snd_pcm_substream *substream,
+				       dma_cookie_t cookie)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int stream = substream->stream;
+
+	if (!runtime->dma_area || !runtime->dma_buffer_p)
+		return 0;
+
+	if (pcm->retained[stream].area) {
+		if (runtime->dma_addr != pcm->retained[stream].addr)
+			dev_err(pcm->component.dev,
+				"DMA still active; keeping an extra %s buffer\n",
+				snd_pcm_stream_str(substream));
+		dmaengine_pcm_detach_runtime_buffer(substream);
+		return 0;
+	}
+
+	pcm->retained[stream] = *runtime->dma_buffer_p;
+	pcm->retained_cookie[stream] = cookie;
+	dmaengine_pcm_detach_runtime_buffer(substream);
+	dev_err(pcm->component.dev,
+		"DMA stop timed out; retaining %s PCM buffer\n",
+		snd_pcm_stream_str(substream));
+	return 0;
+}
+
+/*
+ * Returns -EBUSY while a retained buffer is still reachable by DMA.
+ * @allocating is set when a new PCM buffer is about to be programmed.
+ */
+static int dmaengine_pcm_release_retained(struct dmaengine_pcm *pcm,
+					  struct snd_pcm_substream *substream,
+					  bool allocating)
+{
+	int stream = substream->stream;
+	struct dma_chan *chan = pcm->chan[stream];
+
+	if (!pcm->retained[stream].area)
+		return 0;
+
+	dmaengine_pcm_halt(chan);
+	if (!dmaengine_pcm_cookie_idle(chan, pcm->retained_cookie[stream])) {
+		if (allocating)
+			dev_err(pcm->component.dev,
+				"DMA still active on %s; refusing a new buffer\n",
+				snd_pcm_stream_str(substream));
+		return -EBUSY;
+	}
+
+	if (!substream->dma_buffer.area) {
+		substream->dma_buffer = pcm->retained[stream];
+		memset(&pcm->retained[stream], 0,
+		       sizeof(pcm->retained[stream]));
+		pcm->retained_cookie[stream] = 0;
+		return 0;
+	}
+
+	dmaengine_pcm_free_retained(pcm, stream);
+	return 0;
+}
+
+static bool dmaengine_pcm_retire_stream(struct dmaengine_pcm *pcm, int stream)
+{
+	struct dma_chan *chan = pcm->chan[stream];
+
+	if (!pcm->retained[stream].area)
+		return true;
+	dmaengine_pcm_halt(chan);
+	if (!dmaengine_pcm_cookie_idle(chan, pcm->retained_cookie[stream]))
+		return false;
+	dmaengine_pcm_free_retained(pcm, stream);
+	return true;
+}
+
+static int dmaengine_pcm_hw_free(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+	struct snd_soc_component *component =
+		snd_soc_rtdcom_lookup(rtd, SND_DMAENGINE_PCM_DRV_NAME);
+	struct dmaengine_pcm *pcm = soc_component_to_pcm(component);
+	struct dma_chan *chan;
+	dma_cookie_t cookie;
+	int stream = substream->stream;
+
+	if (!substream->runtime || !substream->runtime->private_data)
+		return snd_pcm_lib_free_pages(substream);
+
+	chan = snd_dmaengine_pcm_get_chan(substream);
+	cookie = snd_dmaengine_pcm_get_cookie(substream);
+
+	if (cookie > 0 && !dmaengine_pcm_cookie_idle(chan, cookie)) {
+		dmaengine_pcm_halt(chan);
+		if (!dmaengine_pcm_cookie_idle(chan, cookie))
+			return dmaengine_pcm_retain_buffer(pcm, substream,
+							   cookie);
+	}
+
+	if (pcm->retained[stream].area)
+		dmaengine_pcm_release_retained(pcm, substream, false);
+
+	return snd_pcm_lib_free_pages(substream);
+}
+
 static int dmaengine_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_hw_params *params)
 {
@@ -88,6 +248,10 @@ static int dmaengine_pcm_hw_params(struct snd_pcm_substream *substream,
 			struct dma_slave_config *slave_config);
 	struct dma_slave_config slave_config;
 	int ret;
+
+	ret = dmaengine_pcm_release_retained(pcm, substream, true);
+	if (ret)
+		return ret;
 
 	memset(&slave_config, 0, sizeof(slave_config));
 
@@ -109,7 +273,8 @@ static int dmaengine_pcm_hw_params(struct snd_pcm_substream *substream,
 	return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(params));
 }
 
-static int dmaengine_pcm_set_runtime_hwparams(struct snd_pcm_substream *substream)
+static int dmaengine_pcm_set_runtime_hwparams(
+	struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
 	struct snd_soc_component *component =
@@ -149,7 +314,8 @@ static int dmaengine_pcm_set_runtime_hwparams(struct snd_pcm_substream *substrea
 	if (ret == 0) {
 		if (dma_caps.cmd_pause && dma_caps.cmd_resume)
 			hw.info |= SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME;
-		if (dma_caps.residue_granularity <= DMA_RESIDUE_GRANULARITY_SEGMENT)
+		if (dma_caps.residue_granularity <=
+		    DMA_RESIDUE_GRANULARITY_SEGMENT)
 			hw.info |= SNDRV_PCM_INFO_BATCH;
 
 		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
@@ -174,7 +340,8 @@ static int dmaengine_pcm_set_runtime_hwparams(struct snd_pcm_substream *substrea
 		 * default assumption is that it supports 1, 2 and 4 bytes
 		 * widths.
 		 */
-		for (i = SNDRV_PCM_FORMAT_FIRST; i <= SNDRV_PCM_FORMAT_LAST; i++) {
+		for (i = SNDRV_PCM_FORMAT_FIRST;
+		     i <= SNDRV_PCM_FORMAT_LAST; i++) {
 			int bits = snd_pcm_format_physical_width(i);
 
 			/*
@@ -280,7 +447,8 @@ static int dmaengine_pcm_new(struct snd_soc_pcm_runtime *rtd)
 		max_buffer_size = SIZE_MAX;
 	}
 
-	for (i = SNDRV_PCM_STREAM_PLAYBACK; i <= SNDRV_PCM_STREAM_CAPTURE; i++) {
+	for (i = SNDRV_PCM_STREAM_PLAYBACK;
+	     i <= SNDRV_PCM_STREAM_CAPTURE; i++) {
 		substream = rtd->pcm->streams[i].substream;
 		if (!substream)
 			continue;
@@ -292,7 +460,8 @@ static int dmaengine_pcm_new(struct snd_soc_pcm_runtime *rtd)
 			pcm->chan[i] = dma_request_slave_channel(dev,
 				dma_data->chan_name);
 
-		if (!pcm->chan[i] && (pcm->flags & SND_DMAENGINE_PCM_FLAG_COMPAT)) {
+		if (!pcm->chan[i] &&
+		    (pcm->flags & SND_DMAENGINE_PCM_FLAG_COMPAT)) {
 			pcm->chan[i] = dmaengine_pcm_compat_request_channel(rtd,
 				substream);
 		}
@@ -360,7 +529,8 @@ static int dmaengine_copy_user(struct snd_pcm_substream *substream,
 			return -EFAULT;
 
 	if (process) {
-		ret = process(substream, channel, hwoff, (__force void *)buf, bytes);
+		ret = process(substream, channel, hwoff,
+			      (__force void *)buf, bytes);
 		if (ret < 0)
 			return ret;
 	}
@@ -377,7 +547,7 @@ static const struct snd_pcm_ops dmaengine_pcm_ops = {
 	.close		= snd_dmaengine_pcm_close,
 	.ioctl		= snd_pcm_lib_ioctl,
 	.hw_params	= dmaengine_pcm_hw_params,
-	.hw_free	= snd_pcm_lib_free_pages,
+	.hw_free	= dmaengine_pcm_hw_free,
 	.trigger	= snd_dmaengine_pcm_trigger,
 	.pointer	= dmaengine_pcm_pointer,
 };
@@ -387,7 +557,7 @@ static const struct snd_pcm_ops dmaengine_pcm_process_ops = {
 	.close		= snd_dmaengine_pcm_close,
 	.ioctl		= snd_pcm_lib_ioctl,
 	.hw_params	= dmaengine_pcm_hw_params,
-	.hw_free	= snd_pcm_lib_free_pages,
+	.hw_free	= dmaengine_pcm_hw_free,
 	.trigger	= snd_dmaengine_pcm_trigger,
 	.pointer	= dmaengine_pcm_pointer,
 	.copy_user	= dmaengine_copy_user,
@@ -465,14 +635,39 @@ static int dmaengine_pcm_request_chan_of(struct dmaengine_pcm *pcm,
 static void dmaengine_pcm_release_chan(struct dmaengine_pcm *pcm)
 {
 	unsigned int i;
+	bool idle = true;
+
+	if (pcm->flags & SND_DMAENGINE_PCM_FLAG_HALF_DUPLEX) {
+		for (i = SNDRV_PCM_STREAM_PLAYBACK;
+		     i <= SNDRV_PCM_STREAM_CAPTURE; i++) {
+			if (pcm->chan[i] &&
+			    !dmaengine_pcm_retire_stream(pcm, i))
+				idle = false;
+		}
+		if (pcm->chan[0] && idle)
+			dma_release_channel(pcm->chan[0]);
+		else if (pcm->chan[0])
+			dev_err(pcm->component.dev,
+				"DMA stop timed out; leaking the shared PCM channel and buffer\n");
+		pcm->chan[0] = NULL;
+		pcm->chan[1] = NULL;
+		return;
+	}
 
 	for (i = SNDRV_PCM_STREAM_PLAYBACK; i <= SNDRV_PCM_STREAM_CAPTURE;
 	     i++) {
 		if (!pcm->chan[i])
 			continue;
+		if (!dmaengine_pcm_retire_stream(pcm, i)) {
+			dev_err(pcm->component.dev,
+				"DMA stop timed out; leaking %s channel and PCM buffer\n",
+				i == SNDRV_PCM_STREAM_PLAYBACK ?
+				"playback" : "capture");
+			pcm->chan[i] = NULL;
+			continue;
+		}
 		dma_release_channel(pcm->chan[i]);
-		if (pcm->flags & SND_DMAENGINE_PCM_FLAG_HALF_DUPLEX)
-			break;
+		pcm->chan[i] = NULL;
 	}
 }
 
