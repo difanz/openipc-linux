@@ -1,0 +1,26 @@
+Fullhan FH8626V100 GPIO controller
+
+The parent node owns the controller window. Each port is a child
+node. The child uses the Synopsys DW APB GPIO port binding; see
+Documentation/devicetree/bindings/gpio/snps-dwapb-gpio.txt.
+Port properties are not redefined here.
+
+Required parent properties:
+- compatible: "fullhan,fh8626v100-gpio"
+- reg: MMIO window of the controller
+- #address-cells: must be <1>
+- #size-cells: must be <0>
+
+Example:
+
+	gpio-controller@f0300000 {
+		compatible = "fullhan,fh8626v100-gpio";
+		reg = <0xf0300000 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		gpio-controller@0 {
+			compatible = "snps,dw-apb-gpio-port";
+			reg = <0>;
+		};
+	};
