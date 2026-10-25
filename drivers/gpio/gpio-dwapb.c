@@ -59,6 +59,8 @@
 #define GPIO_SWPORT_DDR_STRIDE	0x0c /* register stride 3*32 bits */
 
 #define GPIO_REG_OFFSET_V2	1
+#define GPIO_FH8626		BIT(1)
+#define GPIO_INT_BOTHEDGE	0x68
 
 #define GPIO_INTMASK_V2		0x44
 #define GPIO_INTTYPE_LEVEL_V2	0x34
@@ -100,6 +102,8 @@ struct dwapb_gpio {
 	unsigned int		nr_ports;
 	struct irq_domain	*domain;
 	unsigned int		flags;
+	int			parent_irq;
+	bool			chained;
 	struct reset_control	*rst;
 	struct clk		*clk;
 };
@@ -321,6 +325,15 @@ static int dwapb_irq_set_type(struct irq_data *d, u32 type)
 	dwapb_write(gpio, GPIO_INTTYPE_LEVEL, level);
 	if (type != IRQ_TYPE_EDGE_BOTH)
 		dwapb_write(gpio, GPIO_INT_POLARITY, polarity);
+	/*
+	 * The FH8626 variant has a hardware both-edge register. Keep it clear
+	 * and handle EDGE_BOTH with the generic software polarity toggle.
+	 */
+	if (gpio->flags & GPIO_FH8626) {
+		u32 both = dwapb_read(gpio, GPIO_INT_BOTHEDGE);
+
+		dwapb_write(gpio, GPIO_INT_BOTHEDGE, both & ~BIT(bit));
+	}
 	spin_unlock_irqrestore(&gc->bgpio_lock, flags);
 
 	return 0;
@@ -452,6 +465,10 @@ static void dwapb_configure_irqs(struct dwapb_gpio *gpio,
 				irq_set_chained_handler_and_data(pp->irq[i],
 						dwapb_irq_handler, gpio);
 		}
+		if ((gpio->flags & GPIO_FH8626) && pp->irq[0] >= 0) {
+			gpio->parent_irq = pp->irq[0];
+			gpio->chained = true;
+		}
 	} else {
 		/*
 		 * Request a shared IRQ since where MFD would have devices
@@ -483,6 +500,17 @@ static void dwapb_irq_teardown(struct dwapb_gpio *gpio)
 
 	if (!gpio->domain)
 		return;
+
+	/*
+	 * Mask bank interrupts and detach the chained handler before domain
+	 * removal.
+	 */
+	if (gpio->chained) {
+		writel(0, gpio->regs + GPIO_INTEN);
+		irq_set_chained_handler_and_data(gpio->parent_irq, NULL, NULL);
+		synchronize_irq(gpio->parent_irq);
+		gpio->chained = false;
+	}
 
 	for (hwirq = 0 ; hwirq < ngpio ; hwirq++)
 		irq_dispose_mapping(irq_find_mapping(gpio->domain, hwirq));
@@ -529,8 +557,11 @@ static int dwapb_gpio_add_port(struct dwapb_gpio *gpio,
 	port->gc.ngpio = pp->ngpio;
 	port->gc.base = pp->gpio_base;
 
-	/* Only port A support debounce */
-	if (pp->idx == 0)
+	/*
+	 * Port A debounce is the shared gpioN_dbclk. Leave set_config
+	 * unset so gpio-keys times the debounce itself.
+	 */
+	if (pp->idx == 0 && !(gpio->flags & GPIO_FH8626))
 		port->gc.set_config = dwapb_gpio_set_config;
 
 	if (pp->has_irq)
@@ -614,6 +645,18 @@ dwapb_gpio_get_pdata(struct device *dev)
 
 		pp->irq_shared	= false;
 		pp->gpio_base	= -1;
+		if (dev->of_node &&
+		    of_device_is_compatible(dev->of_node,
+					    "fullhan,fh8626v100-gpio")) {
+			u32 addr = 0;
+
+			if (!of_property_read_u32(dev->of_node, "reg", &addr)) {
+				if (addr == 0xf0300000)
+					pp->gpio_base = 0;
+				else if (addr == 0xf4000000)
+					pp->gpio_base = 32;
+			}
+		}
 
 		/*
 		 * Only port A can provide interrupts in all configurations of
@@ -648,6 +691,7 @@ dwapb_gpio_get_pdata(struct device *dev)
 
 static const struct of_device_id dwapb_of_match[] = {
 	{ .compatible = "snps,dw-apb-gpio", .data = (void *)0},
+	{ .compatible = "fullhan,fh8626v100-gpio", .data = (void *)GPIO_FH8626},
 	{ .compatible = "apm,xgene-gpio-v2", .data = (void *)GPIO_REG_OFFSET_V2},
 	{ /* Sentinel */ }
 };
@@ -685,6 +729,7 @@ static int dwapb_gpio_probe(struct platform_device *pdev)
 
 	gpio->dev = &pdev->dev;
 	gpio->nr_ports = pdata->nports;
+	gpio->parent_irq = -1;
 
 	gpio->rst = devm_reset_control_get_optional_shared(dev, NULL);
 	if (IS_ERR(gpio->rst))
